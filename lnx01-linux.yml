@@ -1,0 +1,224 @@
+---
+# =============================================================================
+#  lnx01-linux.yml — Rocky/RHEL istemci -> corp.local domain join (192.168.56.12)
+#
+#  STANDART + 1 ZORUNLU İSTİSNA:
+#  sssd.conf'u realm join kendi varsayılanıyla üretir. Tek eklenen şey [nss]
+#  filter_users/filter_groups — bu olmadan join'den sonraki ilk 'sudo' AD'ye
+#  sorgu düşürüp kilitleniyor (Ansible: "Timeout waiting for privilege
+#  escalation prompt"). filter_users/[nss] zaten SSSD'nin klasik varsayılan
+#  bölümüdür, egzotik bir ayar değildir.
+#
+#  ÖN KOŞUL: dc01-windows.yml çalışmış olmalı; linuxuser01'e SSH anahtarı kurulu:
+#     ssh-copy-id linuxuser01@192.168.56.12
+#  Çalıştır:  ansible-playbook -i inventory.yml lnx01-linux.yml
+# =============================================================================
+- name: lnx01 - Active Directory domain join
+  hosts: linux
+  become: true
+
+  vars_files:
+    - secret_vars.yml
+
+  vars:
+    ad_domain: corp.local
+    ad_realm: CORP.LOCAL
+    dc_ip: 192.168.56.10
+    join_user: Administrator
+    join_pass: "{{ vault_win_password }}"
+    local_users: "root, linuxuser01"
+    local_groups: "root, wheel"
+
+  tasks:
+    - name: FQDN ayarla (Kerberos principal için)
+      ansible.builtin.hostname:
+        name: lnx01.corp.local
+
+    - name: Aktif NetworkManager bağlantısının adını bul
+      ansible.builtin.shell: nmcli -t -f NAME connection show --active | head -n1
+      register: nm_con
+      changed_when: false
+
+    - name: DNS'i DC'ye yönlendir (NetworkManager)
+      ansible.builtin.shell: |
+        nmcli connection modify "{{ nm_con.stdout }}" ipv4.dns "{{ dc_ip }}" ipv4.ignore-auto-dns yes
+        nmcli connection up "{{ nm_con.stdout }}"
+      when: nm_con.stdout | length > 0
+      changed_when: true
+
+    - name: DNS DC'yi çözüyor mu (join'den önce doğrula)
+      ansible.builtin.command: "getent hosts {{ ad_domain }}"
+      register: dns_check
+      changed_when: false
+      retries: 3
+      delay: 3
+      until: dns_check.rc == 0
+
+    - name: chrony kur (saat senkronu = clock skew önlemi)
+      ansible.builtin.package:
+        name: chrony
+        state: present
+
+    - name: chrony'yi başlat
+      ansible.builtin.service:
+        name: chronyd
+        state: started
+        enabled: true
+
+    - name: Domain join paketleri (realmd + SSSD)
+      ansible.builtin.package:
+        name:
+          - realmd
+          - sssd
+          - sssd-tools
+          - adcli
+          - krb5-workstation
+          - samba-common-tools
+          - oddjob
+          - oddjob-mkhomedir
+        state: present
+
+    # realm join biter bitmez SSSD'yi kendisi başlatır ve o an sudo kilitlenir.
+    # Bu yüzden join ile SSSD'yi durdurmayı AYNI become oturumunda yapıyoruz;
+    # [nss] filtresi yazılana kadar SSSD kapalı kalıyor.
+    - name: Domain'e katıl (gerekirse) ve SSSD'yi geçici olarak durdur
+      ansible.builtin.shell: |
+        set -e
+        if ! realm list --name-only | grep -qx '{{ ad_domain }}'; then
+          echo '{{ join_pass }}' | realm join --user='{{ join_user }}' {{ ad_domain }}
+        fi
+        systemctl stop sssd
+      no_log: true
+      changed_when: true
+
+    - name: Yerel kullanıcı/grupları AD sorgusundan muaf tut ([nss] filtresi)
+      ansible.builtin.blockinfile:
+        path: /etc/sssd/sssd.conf
+        owner: root
+        group: root
+        mode: "0600"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - nss filter"
+        insertafter: EOF
+        block: |
+          [nss]
+          filter_users = {{ local_users }}
+          filter_groups = {{ local_groups }}
+
+    - name: SSSD'yi başlat (artık sudo takılmaz)
+      ansible.builtin.service:
+        name: sssd
+        state: restarted
+        enabled: true
+
+    - name: İlk girişte ev dizini otomatik oluşsun (mkhomedir)
+      ansible.builtin.command: authselect select sssd with-mkhomedir --force
+      register: authselect
+      changed_when: "'selected' in authselect.stdout or 'backed up' in authselect.stdout"
+
+    - name: oddjobd servisini başlat
+      ansible.builtin.service:
+        name: oddjobd
+        state: started
+        enabled: true
+
+    - name: sudo yetkisi (linux-admins grubuna NOPASSWD)
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/linux-admins
+        content: "%linux-admins@corp.local ALL=(ALL) NOPASSWD:ALL\n"
+        mode: "0440"
+        validate: "visudo -cf %s"
+
+    - name: Kerberos passwordless SSO (sshd GSSAPI)
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?GSSAPIAuthentication'
+        line: "GSSAPIAuthentication yes"
+        validate: "sshd -t -f %s"
+      notify: restart sshd
+
+    - name: Bekleyen handler'ları şimdi çalıştır
+      ansible.builtin.meta: flush_handlers
+
+    # -------------------------------------------------------------------------
+    #  DOĞRULAMA + otomatik teşhis
+    #  Lookup başarısız olursa playbook debug_level'i açar, SSSD'yi yeniden
+    #  başlatır, tekrar dener ve tüm teşhis verisini ekrana basar.
+    # -------------------------------------------------------------------------
+    - name: DOĞRULAMA
+      block:
+        - name: AD kullanıcısı çözülüyor mu (root gerekmez)
+          ansible.builtin.command: id tolga.cerit@corp.local
+          become: false
+          register: id_check
+          changed_when: false
+          retries: 6
+          delay: 10
+          until: id_check.rc == 0
+
+        - name: Sonuç
+          ansible.builtin.debug:
+            msg: "{{ id_check.stdout }}"
+
+      rescue:
+        - name: TEŞHİS — SSSD debug seviyesini geçici yükselt
+          ansible.builtin.blockinfile:
+            path: /etc/sssd/sssd.conf
+            marker: "# {mark} ANSIBLE MANAGED BLOCK - debug"
+            insertafter: '^\[domain/{{ ad_domain }}\]'
+            block: "debug_level = 6"
+
+        - name: TEŞHİS — SSSD önbelleğini temizle ve yeniden başlat
+          ansible.builtin.shell: |
+            systemctl stop sssd
+            rm -f /var/lib/sss/db/*.ldb /var/log/sssd/*.log
+            systemctl start sssd
+            sleep 15
+          changed_when: true
+
+        - name: TEŞHİS — tüm veriyi topla
+          ansible.builtin.shell: |
+            echo "===== realm list ====="
+            realm list 2>&1 || true
+            echo "===== sssd durumu ====="
+            systemctl is-active sssd; systemctl is-enabled sssd
+            echo "===== nsswitch ====="
+            grep -E '^(passwd|group|initgroups)' /etc/nsswitch.conf || true
+            echo "===== sssd.conf (etkin satırlar) ====="
+            grep -vE '^\s*(#|$)' /etc/sssd/sssd.conf || true
+            echo "===== domain-status ====="
+            sssctl domain-status {{ ad_domain }} 2>&1 || true
+            echo "===== FQ isimle lookup ====="
+            getent passwd tolga.cerit@{{ ad_domain }}; echo "rc=$?"
+            echo "===== KISA isimle lookup ====="
+            getent passwd tolga.cerit; echo "rc=$?"
+            echo "===== sssctl user-checks (FQ) ====="
+            sssctl user-checks tolga.cerit@{{ ad_domain }} 2>&1 | head -n 25 || true
+            echo "===== DNS: DC SRV kayitlari ====="
+            getent hosts {{ ad_domain }} 2>&1 || true
+            dig +short -t SRV _ldap._tcp.{{ ad_domain }} 2>&1 || true
+            echo "===== makine hesabi Kerberos ====="
+            klist -k 2>&1 | head -n 10 || true
+            echo "===== sssd domain log (son 60) ====="
+            tail -n 60 /var/log/sssd/sssd_{{ ad_domain }}.log 2>&1 || true
+            echo "===== sssd_nss log (son 20) ====="
+            tail -n 20 /var/log/sssd/sssd_nss.log 2>&1 || true
+          register: diag
+          changed_when: false
+          failed_when: false
+
+        - name: TEŞHİS ÇIKTISI
+          ansible.builtin.debug:
+            var: diag.stdout_lines
+
+        - name: Doğrulama başarısız — yukaridaki TEŞHİS ÇIKTISI'ni paylaş
+          ansible.builtin.fail:
+            msg: >-
+              id tolga.cerit@{{ ad_domain }} çözülemedi.
+              debug_level = 6 açık bırakıldı; sorun çözülünce sssd.conf'tan
+              "ANSIBLE MANAGED BLOCK - debug" bloğunu kaldır.
+
+  handlers:
+    - name: restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted

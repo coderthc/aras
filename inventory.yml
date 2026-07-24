@@ -1,0 +1,34 @@
+---
+# =============================================================================
+#  ENVANTER — 2 makineli lab (DC + Linux istemci)
+#  Şifreler secret_vars.yml (Ansible Vault) içinde.
+#  Çalıştırma:
+#     ansible-playbook -i inventory.yml dc01-windows.yml
+#     ansible-playbook -i inventory.yml lnx01-linux.yml
+#  (ansible.cfg içinde vault_password_file tanımlı -> --ask-vault-pass gerekmez)
+# =============================================================================
+all:
+  children:
+
+    windows:
+      hosts:
+        dc01:
+          ansible_host: 192.168.56.10
+      vars:
+        ansible_connection: winrm
+        ansible_port: 5985
+        ansible_winrm_transport: ntlm
+        ansible_winrm_server_cert_validation: ignore
+        ansible_user: "{{ vault_win_user }}"
+        ansible_password: "{{ vault_win_password }}"
+
+    linux:
+      hosts:
+        lnx01:
+          ansible_host: 192.168.56.12
+      vars:
+        ansible_connection: ssh
+        ansible_user: linuxuser01
+        ansible_become: true
+        ansible_become_method: sudo
+        ansible_become_password: "{{ vault_become_password }}"

@@ -1,0 +1,106 @@
+---
+# =============================================================================
+#  dc01-windows.yml — Windows Server -> Domain Controller (192.168.56.10)
+#
+#  STANDART SÜRÜM: Yerleşik konteynerlar kullanılır (kullanıcılar CN=Users).
+#  Sadece güvenlik grupları için OU=Groups oluşturulur.
+#  Yapar: hostname=DC01, DNS(self), AD DS + DNS rolleri, corp.local forest,
+#         grup OU'su, linux-admins / linux-sudoers grupları, tolga.cerit.
+#
+#  TEK SEFERLİK ÖN KOŞUL (DC'de yönetici PowerShell):
+#     Enable-PSRemoting -Force
+#     New-NetFirewallRule -DisplayName "WinRM-HTTP" -Direction Inbound `
+#       -LocalPort 5985 -Protocol TCP -Action Allow
+#
+#  Çalıştır:  ansible-playbook -i inventory.yml dc01-windows.yml
+# =============================================================================
+- name: DC01 - Active Directory Domain Controller kurulumu
+  hosts: windows
+  gather_facts: false
+
+  vars_files:
+    - secret_vars.yml
+
+  vars:
+    ad_domain: corp.local
+    ad_netbios: CORP
+    ad_base_dn: "DC=corp,DC=local"
+    dsrm_password: "{{ vault_dsrm_password }}"
+    user_password: "{{ vault_user_password }}"
+
+  tasks:
+    - name: Bilgisayar adını DC01 yap
+      ansible.windows.win_hostname:
+        name: DC01
+      register: rename
+
+    - name: Ad değişince yeniden başlat
+      ansible.windows.win_reboot:
+      when: rename.reboot_required
+
+    - name: DNS'i kendine göster (DC = DNS sunucusu)
+      ansible.windows.win_dns_client:
+        adapter_names: "*"
+        dns_servers:
+          - 127.0.0.1
+
+    - name: AD DS ve DNS rollerini kur
+      ansible.windows.win_feature:
+        name:
+          - AD-Domain-Services
+          - DNS
+        include_management_tools: true
+        state: present
+
+    - name: Yeni forest oluştur ve DC'ye yükselt (idempotent)
+      microsoft.ad.domain:
+        dns_domain_name: "{{ ad_domain }}"
+        domain_netbios_name: "{{ ad_netbios }}"
+        safe_mode_password: "{{ dsrm_password }}"
+        install_dns: true
+        reboot: true
+
+    - name: AD Web Services hazır olana kadar bekle
+      ansible.windows.win_service_info:
+        name: ADWS
+      register: adws
+      until: adws.services | length > 0 and adws.services[0].state == "started"
+      retries: 30
+      delay: 10
+
+    - name: Gruplar için OU
+      microsoft.ad.ou:
+        name: Groups
+        path: "{{ ad_base_dn }}"
+        state: present
+
+    - name: Güvenlik grupları (Linux erişimi)
+      microsoft.ad.group:
+        name: "{{ item }}"
+        scope: global
+        path: "OU=Groups,{{ ad_base_dn }}"
+        state: present
+      loop:
+        - linux-admins
+        - linux-sudoers
+
+    - name: Kullanıcı tolga.cerit (yerleşik CN=Users konteynerinde)
+      microsoft.ad.user:
+        name: tolga.cerit
+        upn: "tolga.cerit@{{ ad_domain }}"
+        path: "CN=Users,{{ ad_base_dn }}"
+        password: "{{ user_password }}"
+        password_never_expires: true
+        update_password: on_create
+        state: present
+      no_log: true
+
+    - name: tolga.cerit'i linux-admins grubuna ekle
+      microsoft.ad.group:
+        name: linux-admins
+        scope: global
+        path: "OU=Groups,{{ ad_base_dn }}"
+        members:
+          add:
+            - tolga.cerit
+        state: present
